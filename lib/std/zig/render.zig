@@ -1673,20 +1673,22 @@ fn renderArrayInit(
     const contains_comment = hasComment(tree, array_init.ast.lbrace, rbrace);
     const contains_multiline_string = hasMultilineString(tree, array_init.ast.lbrace, rbrace);
 
-    if (array_init.ast.elements.len == 1 and !trailing_comma and !contains_comment) {
-        // If there is only one element, we don't use spaces
-        try renderToken(ais, tree, array_init.ast.lbrace, .none);
-        try renderExpression(gpa, ais, tree, array_init.ast.elements[0], .none);
-    } else if (trailing_comma or contains_comment or contains_multiline_string) {
-        try renderToken(ais, tree, array_init.ast.lbrace, .newline);
+    const must_be_multiline = trailing_comma or contains_comment or contains_multiline_string;
 
+    if (must_be_multiline) {
+        // render on multiple lines
         ais.pushIndent();
+
+        try renderToken(ais, tree, array_init.ast.lbrace, .newline);
         try renderExpressions(gpa, ais, tree, array_init.ast.elements, .comma);
 
         ais.popIndent();
+    } else if (array_init.ast.elements.len == 1) {
+        // If there is only one element, we don't use spaces
+        try renderToken(ais, tree, array_init.ast.lbrace, .none);
+        try renderExpression(gpa, ais, tree, array_init.ast.elements[0], .none);
     } else {
         // render on one line, dropping the trailing comma
-
         try renderToken(ais, tree, array_init.ast.lbrace, .space);
         for (array_init.ast.elements) |elem| {
             try renderExpression(gpa, ais, tree, elem, .comma_space);

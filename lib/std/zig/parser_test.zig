@@ -680,24 +680,6 @@ test "zig fmt: anon literal in array" {
     );
 }
 
-test "zig fmt: alignment in anonymous literal" {
-    try testTransform(
-        \\const a = .{
-        \\    "U",     "L",     "F",
-        \\    "U'",
-        \\    "L'",
-        \\    "F'",
-        \\};
-        \\
-    ,
-        \\const a = .{
-        \\    "U",  "L",  "F",
-        \\    "U'", "L'", "F'",
-        \\};
-        \\
-    );
-}
-
 test "zig fmt: anon struct literal 0 element" {
     try testCanonical(
         \\test {
@@ -1883,130 +1865,6 @@ test "zig fmt: struct literal containing a multiline expression" {
     );
 }
 
-// test "zig fmt: array literal with hint" {
-//     try testTransform(
-//         \\const a = []u8{
-//         \\    1, 2, //
-//         \\    3,
-//         \\    4,
-//         \\    5,
-//         \\    6,
-//         \\    7 };
-//         \\const a = []u8{
-//         \\    1, 2, //
-//         \\    3,
-//         \\    4,
-//         \\    5,
-//         \\    6,
-//         \\    7, 8 };
-//         \\const a = []u8{
-//         \\    1, 2, //
-//         \\    3,
-//         \\    4,
-//         \\    5,
-//         \\    6, // blah
-//         \\    7, 8 };
-//         \\const a = []u8{
-//         \\    1, 2, //
-//         \\    3, //
-//         \\    4,
-//         \\    5,
-//         \\    6,
-//         \\    7 };
-//         \\const a = []u8{
-//         \\    1,
-//         \\    2,
-//         \\    3, 4, //
-//         \\    5, 6, //
-//         \\    7, 8, //
-//         \\};
-//     ,
-//         \\const a = []u8{
-//         \\    1, 2, //
-//         \\    3, 4,
-//         \\    5, 6,
-//         \\    7,
-//         \\};
-//         \\const a = []u8{
-//         \\    1, 2, //
-//         \\    3, 4,
-//         \\    5, 6,
-//         \\    7, 8,
-//         \\};
-//         \\const a = []u8{
-//         \\    1, 2, //
-//         \\    3, 4,
-//         \\    5,
-//         \\    6, // blah
-//         \\    7,
-//         \\    8,
-//         \\};
-//         \\const a = []u8{
-//         \\    1, 2, //
-//         \\    3, //
-//         \\    4,
-//         \\    5,
-//         \\    6,
-//         \\    7,
-//         \\};
-//         \\const a = []u8{
-//         \\    1,
-//         \\    2,
-//         \\    3, 4, //
-//         \\    5, 6, //
-//         \\    7, 8, //
-//         \\};
-//         \\
-//     );
-// }
-
-// test "zig fmt: array literal vertical column alignment" {
-//     try testTransform(
-//         \\const a = []u8{
-//         \\    1000, 200,
-//         \\    30, 4,
-//         \\    50000, 60,
-//         \\};
-//         \\const a = []u8{0,   1, 2, 3, 40,
-//         \\    4,5,600,7,
-//         \\           80,
-//         \\    9, 10, 11, 0, 13, 14, 15,};
-//         \\const a = [12]u8{
-//         \\    31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-//         \\const a = [12]u8{
-//         \\    31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, };
-//         \\
-//     ,
-//         \\const a = []u8{
-//         \\    1000,  200,
-//         \\    30,    4,
-//         \\    50000, 60,
-//         \\};
-//         \\const a = []u8{
-//         \\    0,  1,  2,   3, 40,
-//         \\    4,  5,  600, 7, 80,
-//         \\    9,  10, 11,  0, 13,
-//         \\    14, 15,
-//         \\};
-//         \\const a = [12]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-//         \\const a = [12]u8{
-//         \\    31,
-//         \\    28,
-//         \\    31,
-//         \\    30,
-//         \\    31,
-//         \\    30,
-//         \\    31,
-//         \\    31,
-//         \\    30,
-//         \\    31,
-//         \\    30,
-//         \\    31,
-//         \\};
-//         \\
-//     );
-// }
-
 test "zig fmt: multiline string with backslash at end of line" {
     try testCanonical(
         \\comptime {
@@ -2202,7 +2060,11 @@ test "zig fmt: add trailing comma to array literal" {
     ,
         \\comptime {
         \\    return []u16{
-        \\        'm', 's', 'y', 's', '-', // hi
+        \\        'm',
+        \\        's',
+        \\        'y',
+        \\        's',
+        \\        '-', // hi
         \\    };
         \\    return []u16{ 'm', 's', 'y', 's', '-' };
         \\    return []u16{ 'm', 's', 'y', 's', '-' };
@@ -4503,43 +4365,32 @@ test "zig fmt: regression test for #8974" {
     );
 }
 
-// test "zig fmt: allow trailing line comments to do manual array formatting" {
-//     try testCanonical(
-//         \\fn foo() void {
-//         \\    self.code.appendSliceAssumeCapacity(&[_]u8{
-//         \\        0x55, // push rbp
-//         \\        0x48, 0x89, 0xe5, // mov rbp, rsp
-//         \\        0x48, 0x81, 0xec, // sub rsp, imm32 (with reloc)
-//         \\    });
-//         \\
-//         \\    di_buf.appendAssumeCapacity(&[_]u8{
-//         \\        1, DW.TAG_compile_unit, DW.CHILDREN_no, // header
-//         \\        DW.AT_stmt_list, DW_FORM_data4, // form value pairs
-//         \\        DW.AT_low_pc,    DW_FORM_addr,
-//         \\        DW.AT_high_pc,   DW_FORM_addr,
-//         \\        DW.AT_name,      DW_FORM_strp,
-//         \\        DW.AT_comp_dir,  DW_FORM_strp,
-//         \\        DW.AT_producer,  DW_FORM_strp,
-//         \\        DW.AT_language,  DW_FORM_data2,
-//         \\        0, 0, // sentinel
-//         \\    });
-//         \\
-//         \\    self.code.appendSliceAssumeCapacity(&[_]u8{
-//         \\        0x55, // push rbp
-//         \\        0x48, 0x89, 0xe5, // mov rbp, rsp
-//         \\        // How do we handle this?
-//         \\        //0x48, 0x81, 0xec, // sub rsp, imm32 (with reloc)
-//         \\        // Here's a blank line, should that be allowed?
-//         \\
-//         \\        0x48, 0x89, 0xe5,
-//         \\        0x33, 0x45,
-//         \\        // Now the comment breaks a single line -- how do we handle this?
-//         \\        0x88,
-//         \\    });
-//         \\}
-//         \\
-//     );
-// }
+test "zig fmt: on/off comments function within array initializers" {
+    try testTransform(
+        \\pub const A = [_]u8{
+        \\    // zig fmt: off
+        \\   1, 2, 3,
+        \\    4, 5,
+        \\   // zig fmt: on 
+        \\};
+        \\
+        \\pub const B = struct {
+        \\pub const c = 0;
+        \\};        
+    ,
+        \\pub const A = [_]u8{
+        \\    // zig fmt: off
+        \\   1, 2, 3,
+        \\    4, 5,
+        \\   // zig fmt: on
+        \\};
+        \\
+        \\pub const B = struct {
+        \\    pub const c = 0;
+        \\};
+        \\
+    );
+}
 
 test "zig fmt: multiline string literals should play nice with array initializers" {
     try testCanonical(
@@ -4570,13 +4421,15 @@ test "zig fmt: multiline string literals should play nice with array initializer
         \\            \\Multiline String Literals can be quite long
         \\        ),
         \\        .{
-        \\        \\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-        \\        \\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-        \\        \\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-        \\        },
-        \\        .{(
         \\            \\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-        \\        )},
+        \\            \\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        \\            \\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        \\        },
+        \\        .{
+        \\            (
+        \\                \\xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        \\            ),
+        \\        },
         \\        .{
         \\            "xxxxxxx",
         \\            "xxx",
