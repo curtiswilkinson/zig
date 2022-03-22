@@ -108,7 +108,7 @@ pub fn generateFunction(
         //.riscv32 => return Function(.riscv32).generate(bin_file, src_loc, func, air, liveness, code, debug_output),
         .riscv64 => return @import("arch/riscv64/CodeGen.zig").generate(bin_file, src_loc, func, air, liveness, code, debug_output),
         //.sparc => return Function(.sparc).generate(bin_file, src_loc, func, air, liveness, code, debug_output),
-        //.sparcv9 => return Function(.sparcv9).generate(bin_file, src_loc, func, air, liveness, code, debug_output),
+        .sparcv9 => return @import("arch/sparcv9/CodeGen.zig").generate(bin_file, src_loc, func, air, liveness, code, debug_output),
         //.sparcel => return Function(.sparcel).generate(bin_file, src_loc, func, air, liveness, code, debug_output),
         //.s390x => return Function(.s390x).generate(bin_file, src_loc, func, air, liveness, code, debug_output),
         //.tce => return Function(.tce).generate(bin_file, src_loc, func, air, liveness, code, debug_output),
@@ -165,7 +165,7 @@ pub fn generateSymbol(
     const target = bin_file.options.target;
     const endian = target.cpu.arch.endian();
 
-    log.debug("generateSymbol: ty = {}, val = {}", .{ typed_value.ty, typed_value.val });
+    log.debug("generateSymbol: ty = {}, val = {}", .{ typed_value.ty, typed_value.val.fmtDebug() });
 
     if (typed_value.val.isUndefDeep()) {
         const abi_size = try math.cast(usize, typed_value.ty.abiSize(target));

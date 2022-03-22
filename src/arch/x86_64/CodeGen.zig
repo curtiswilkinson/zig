@@ -658,6 +658,7 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .cmp_gte => try self.airCmp(inst, .gte),
             .cmp_gt  => try self.airCmp(inst, .gt),
             .cmp_neq => try self.airCmp(inst, .neq),
+            .cmp_vector => try self.airCmpVector(inst),
 
             .bool_and        => try self.airBoolOp(inst),
             .bool_or         => try self.airBoolOp(inst),
@@ -2174,10 +2175,44 @@ fn airArrayElemVal(self: *Self, inst: Air.Inst.Index) !void {
 fn airPtrElemVal(self: *Self, inst: Air.Inst.Index) !void {
     const is_volatile = false; // TODO
     const bin_op = self.air.instructions.items(.data)[inst].bin_op;
-    const result: MCValue = if (!is_volatile and self.liveness.isUnused(inst))
-        .dead
-    else
-        return self.fail("TODO implement ptr_elem_val for {}", .{self.target.cpu.arch});
+    const result: MCValue = if (!is_volatile and self.liveness.isUnused(inst)) .dead else result: {
+        // this is identical to the `airPtrElemPtr` codegen expect here an
+        // additional `mov` is needed at the end to get the actual value
+
+        const ptr_ty = self.air.typeOf(bin_op.lhs);
+        const ptr = try self.resolveInst(bin_op.lhs);
+        ptr.freezeIfRegister(&self.register_manager);
+        defer ptr.unfreezeIfRegister(&self.register_manager);
+
+        const elem_ty = ptr_ty.elemType2();
+        const elem_abi_size = elem_ty.abiSize(self.target.*);
+        const index_ty = self.air.typeOf(bin_op.rhs);
+        const index = try self.resolveInst(bin_op.rhs);
+        index.freezeIfRegister(&self.register_manager);
+        defer index.unfreezeIfRegister(&self.register_manager);
+
+        const offset_reg = try self.elemOffset(index_ty, index, elem_abi_size);
+        self.register_manager.freezeRegs(&.{offset_reg});
+        defer self.register_manager.unfreezeRegs(&.{offset_reg});
+
+        const dst_mcv = try self.copyToRegisterWithInstTracking(inst, ptr_ty, ptr);
+        try self.genBinMathOpMir(.add, ptr_ty, dst_mcv, .{ .register = offset_reg });
+        if (elem_abi_size > 8) {
+            return self.fail("TODO copy value with size {} from pointer", .{elem_abi_size});
+        } else {
+            // mov dst_mcv, [dst_mcv]
+            _ = try self.addInst(.{
+                .tag = .mov,
+                .ops = (Mir.Ops{
+                    .flags = 0b01,
+                    .reg1 = registerAlias(dst_mcv.register, @intCast(u32, elem_abi_size)),
+                    .reg2 = dst_mcv.register,
+                }).encode(),
+                .data = .{ .imm = 0 },
+            });
+            break :result .{ .register = registerAlias(dst_mcv.register, @intCast(u32, elem_abi_size)) };
+        }
+    };
     return self.finishAir(inst, result, .{ bin_op.lhs, bin_op.rhs, .none });
 }
 
@@ -3663,6 +3698,11 @@ fn airCmp(self: *Self, inst: Air.Inst.Index, op: math.CompareOperator) !void {
     };
 
     return self.finishAir(inst, result, .{ bin_op.lhs, bin_op.rhs, .none });
+}
+
+fn airCmpVector(self: *Self, inst: Air.Inst.Index) !void {
+    _ = inst;
+    return self.fail("TODO implement airCmpVector for {}", .{self.target.cpu.arch});
 }
 
 fn airDbgStmt(self: *Self, inst: Air.Inst.Index) !void {
@@ -5166,7 +5206,7 @@ fn genSetReg(self: *Self, ty: Type, reg: Register, mcv: MCValue) InnerError!void
             if (!self.wantSafety())
                 return; // The already existing value will do just fine.
             // Write the debug undefined value.
-            switch (reg.size()) {
+            switch (registerAlias(reg, abi_size).size()) {
                 8 => return self.genSetReg(ty, reg, .{ .immediate = 0xaa }),
                 16 => return self.genSetReg(ty, reg, .{ .immediate = 0xaaaa }),
                 32 => return self.genSetReg(ty, reg, .{ .immediate = 0xaaaaaaaa }),
@@ -5303,7 +5343,7 @@ fn genSetReg(self: *Self, ty: Type, reg: Register, mcv: MCValue) InnerError!void
             _ = try self.addInst(.{
                 .tag = .mov,
                 .ops = (Mir.Ops{
-                    .reg1 = reg.to64(),
+                    .reg1 = registerAlias(reg, abi_size),
                     .reg2 = reg.to64(),
                     .flags = 0b01,
                 }).encode(),
@@ -5316,7 +5356,7 @@ fn genSetReg(self: *Self, ty: Type, reg: Register, mcv: MCValue) InnerError!void
                 _ = try self.addInst(.{
                     .tag = .mov,
                     .ops = (Mir.Ops{
-                        .reg1 = reg,
+                        .reg1 = registerAlias(reg, abi_size),
                         .flags = 0b01,
                     }).encode(),
                     .data = .{ .imm = @truncate(u32, x) },
@@ -5343,8 +5383,8 @@ fn genSetReg(self: *Self, ty: Type, reg: Register, mcv: MCValue) InnerError!void
                     _ = try self.addInst(.{
                         .tag = .mov,
                         .ops = (Mir.Ops{
-                            .reg1 = reg,
-                            .reg2 = reg,
+                            .reg1 = registerAlias(reg, abi_size),
+                            .reg2 = reg.to64(),
                             .flags = 0b01,
                         }).encode(),
                         .data = .{ .imm = 0 },
@@ -5447,11 +5487,56 @@ fn airIntToFloat(self: *Self, inst: Air.Inst.Index) !void {
 
 fn airFloatToInt(self: *Self, inst: Air.Inst.Index) !void {
     const ty_op = self.air.instructions.items(.data)[inst].ty_op;
-    const result: MCValue = if (self.liveness.isUnused(inst))
-        .dead
-    else
-        return self.fail("TODO implement airFloatToInt for {}", .{self.target.cpu.arch});
-    return self.finishAir(inst, result, .{ ty_op.operand, .none, .none });
+    if (self.liveness.isUnused(inst))
+        return self.finishAir(inst, .dead, .{ ty_op.operand, .none, .none });
+
+    const src_ty = self.air.typeOf(ty_op.operand);
+    const dst_ty = self.air.typeOfIndex(inst);
+    const operand = try self.resolveInst(ty_op.operand);
+
+    // move float src to ST(0)
+    const stack_offset = switch (operand) {
+        .stack_offset, .ptr_stack_offset => |offset| offset,
+        else => blk: {
+            const offset = @intCast(i32, try self.allocMem(
+                inst,
+                @intCast(u32, src_ty.abiSize(self.target.*)),
+                src_ty.abiAlignment(self.target.*),
+            ));
+            try self.genSetStack(src_ty, offset, operand, .{});
+            break :blk offset;
+        },
+    };
+    _ = try self.addInst(.{
+        .tag = .fld,
+        .ops = (Mir.Ops{
+            .flags = switch (src_ty.abiSize(self.target.*)) {
+                4 => 0b01,
+                8 => 0b10,
+                else => |size| return self.fail("TODO load ST(0) with abiSize={}", .{size}),
+            },
+            .reg1 = .rbp,
+        }).encode(),
+        .data = .{ .imm = @bitCast(u32, -stack_offset) },
+    });
+
+    // convert
+    const stack_dst = try self.allocRegOrMem(inst, false);
+    _ = try self.addInst(.{
+        .tag = .fisttp,
+        .ops = (Mir.Ops{
+            .flags = switch (dst_ty.abiSize(self.target.*)) {
+                1...2 => 0b00,
+                3...4 => 0b01,
+                5...8 => 0b10,
+                else => |size| return self.fail("TODO convert float with abiSize={}", .{size}),
+            },
+            .reg1 = .rbp,
+        }).encode(),
+        .data = .{ .imm = @bitCast(u32, -stack_dst.stack_offset) },
+    });
+
+    return self.finishAir(inst, stack_dst, .{ ty_op.operand, .none, .none });
 }
 
 fn airCmpxchg(self: *Self, inst: Air.Inst.Index) !void {
@@ -5735,7 +5820,7 @@ fn lowerDeclRef(self: *Self, tv: TypedValue, decl: *Module.Decl) InnerError!MCVa
 }
 
 fn lowerUnnamedConst(self: *Self, tv: TypedValue) InnerError!MCValue {
-    log.debug("lowerUnnamedConst: ty = {}, val = {}", .{ tv.ty, tv.val });
+    log.debug("lowerUnnamedConst: ty = {}, val = {}", .{ tv.ty, tv.val.fmtDebug() });
     const local_sym_index = self.bin_file.lowerUnnamedConst(tv, self.mod_fn.owner_decl) catch |err| {
         return self.fail("lowering unnamed constant failed: {s}", .{@errorName(err)});
     };

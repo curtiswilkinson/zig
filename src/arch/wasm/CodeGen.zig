@@ -1309,6 +1309,7 @@ fn genInst(self: *Self, inst: Air.Inst.Index) !WValue {
         .cmp_lte => self.airCmp(inst, .lte),
         .cmp_lt => self.airCmp(inst, .lt),
         .cmp_neq => self.airCmp(inst, .neq),
+        .cmp_vector => self.airCmpVector(inst),
 
         .array_elem_val => self.airArrayElemVal(inst),
         .array_to_slice => self.airArrayToSlice(inst),
@@ -1370,6 +1371,7 @@ fn genInst(self: *Self, inst: Air.Inst.Index) !WValue {
         .aggregate_init => self.airAggregateInit(inst),
         .union_init => self.airUnionInit(inst),
         .prefetch => self.airPrefetch(inst),
+        .popcount => self.airPopcount(inst),
 
         .slice => self.airSlice(inst),
         .slice_len => self.airSliceLen(inst),
@@ -1418,7 +1420,6 @@ fn genInst(self: *Self, inst: Air.Inst.Index) !WValue {
         .frame_addr,
         .clz,
         .ctz,
-        .popcount,
         .byte_swap,
         .bit_reverse,
         .is_err_ptr,
@@ -2220,6 +2221,11 @@ fn airCmp(self: *Self, inst: Air.Inst.Index, op: std.math.CompareOperator) Inner
     const cmp_tmp = try self.allocLocal(Type.initTag(.i32)); // bool is always i32
     try self.addLabel(.local_set, cmp_tmp.local);
     return cmp_tmp;
+}
+
+fn airCmpVector(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
+    _ = inst;
+    return self.fail("TODO implement airCmpVector for wasm", .{});
 }
 
 fn airBr(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
@@ -3558,4 +3564,50 @@ fn airMemcpy(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
     const len = try self.resolveInst(bin_op.rhs);
     try self.memcpy(dst, src, len);
     return WValue{ .none = {} };
+}
+
+fn airPopcount(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
+    if (self.liveness.isUnused(inst)) return WValue{ .none = {} };
+    const ty_op = self.air.instructions.items(.data)[inst].ty_op;
+    const operand = try self.resolveInst(ty_op.operand);
+    const op_ty = self.air.typeOf(ty_op.operand);
+
+    if (op_ty.zigTypeTag() == .Vector) {
+        return self.fail("TODO: Implement @popCount for vectors", .{});
+    }
+
+    const int_info = op_ty.intInfo(self.target);
+    const bits = int_info.bits;
+    const wasm_bits = toWasmBits(bits) orelse {
+        return self.fail("TODO: Implement @popCount for integers with bitsize '{d}'", .{bits});
+    };
+
+    try self.emitWValue(operand);
+
+    // for signed integers we first mask the signedness bit
+    if (int_info.signedness == .signed and wasm_bits != bits) {
+        switch (wasm_bits) {
+            32 => {
+                const mask = (@as(u32, 1) << @intCast(u5, bits)) - 1;
+                try self.addImm32(@bitCast(i32, mask));
+                try self.addTag(.i32_and);
+            },
+            64 => {
+                const mask = (@as(u64, 1) << @intCast(u6, bits)) - 1;
+                try self.addImm64(mask);
+                try self.addTag(.i64_and);
+            },
+            else => unreachable,
+        }
+    }
+
+    switch (wasm_bits) {
+        32 => try self.addTag(.i32_popcnt),
+        64 => try self.addTag(.i64_popcnt),
+        else => unreachable,
+    }
+
+    const result = try self.allocLocal(op_ty);
+    try self.addLabel(.local_set, result.local);
+    return result;
 }

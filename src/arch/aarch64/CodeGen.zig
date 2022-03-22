@@ -577,6 +577,7 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .cmp_gte => try self.airCmp(inst, .gte),
             .cmp_gt  => try self.airCmp(inst, .gt),
             .cmp_neq => try self.airCmp(inst, .neq),
+            .cmp_vector => try self.airCmpVector(inst),
 
             .bool_and        => try self.airBinOp(inst),
             .bool_or         => try self.airBinOp(inst),
@@ -2713,6 +2714,11 @@ fn airCmp(self: *Self, inst: Air.Inst.Index, op: math.CompareOperator) !void {
     return self.finishAir(inst, result, .{ bin_op.lhs, bin_op.rhs, .none });
 }
 
+fn airCmpVector(self: *Self, inst: Air.Inst.Index) !void {
+    _ = inst;
+    return self.fail("TODO implement airCmpVector for {}", .{self.target.cpu.arch});
+}
+
 fn airDbgStmt(self: *Self, inst: Air.Inst.Index) !void {
     const dbg_stmt = self.air.instructions.items(.data)[inst].dbg_stmt;
 
@@ -3873,7 +3879,7 @@ fn lowerDeclRef(self: *Self, tv: TypedValue, decl: *Module.Decl) InnerError!MCVa
 }
 
 fn lowerUnnamedConst(self: *Self, tv: TypedValue) InnerError!MCValue {
-    log.debug("lowerUnnamedConst: ty = {}, val = {}", .{ tv.ty, tv.val });
+    log.debug("lowerUnnamedConst: ty = {}, val = {}", .{ tv.ty, tv.val.fmtDebug() });
     const local_sym_index = self.bin_file.lowerUnnamedConst(tv, self.mod_fn.owner_decl) catch |err| {
         return self.fail("lowering unnamed constant failed: {s}", .{@errorName(err)});
     };
