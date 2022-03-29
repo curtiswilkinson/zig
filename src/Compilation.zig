@@ -2042,7 +2042,8 @@ pub fn update(comp: *Compilation) !void {
         comp.c_object_work_queue.writeItemAssumeCapacity(key);
     }
 
-    const use_stage1 = build_options.is_stage1 and comp.bin_file.options.use_stage1;
+    const use_stage1 = build_options.omit_stage2 or
+        (build_options.is_stage1 and comp.bin_file.options.use_stage1);
     if (comp.bin_file.options.module) |module| {
         module.compile_log_text.shrinkAndFree(module.gpa, 0);
         module.generation += 1;
@@ -2198,7 +2199,8 @@ fn flush(comp: *Compilation) !void {
     try comp.bin_file.flush(comp); // This is needed before reading the error flags.
     comp.link_error_flags = comp.bin_file.errorFlags();
 
-    const use_stage1 = build_options.is_stage1 and comp.bin_file.options.use_stage1;
+    const use_stage1 = build_options.omit_stage2 or
+        (build_options.is_stage1 and comp.bin_file.options.use_stage1);
     if (!use_stage1) {
         if (comp.bin_file.options.module) |module| {
             try link.File.C.flushEmitH(module);
@@ -2781,7 +2783,9 @@ fn processOneJob(comp: *Compilation, job: Job, main_progress_node: *std.Progress
                     .error_msg = null,
                     .decl = decl,
                     .fwd_decl = fwd_decl.toManaged(gpa),
-                    .typedefs = c_codegen.TypedefMap.init(gpa),
+                    .typedefs = c_codegen.TypedefMap.initContext(gpa, .{
+                        .target = comp.getTarget(),
+                    }),
                     .typedefs_arena = typedefs_arena.allocator(),
                 };
                 defer dg.fwd_decl.deinit();

@@ -464,6 +464,14 @@ pub const Inst = struct {
         /// Merge two error sets into one, `E1 || E2`.
         /// Uses the `pl_node` field with payload `Bin`.
         merge_error_sets,
+        /// Given a reference to a function and a parameter index, returns the
+        /// type of the parameter. The only usage of this instruction is for the
+        /// result location of parameters of function calls. In the case of a function's
+        /// parameter type being `anytype`, it is the type coercion's job to detect this
+        /// scenario and skip the coercion, so that semantic analysis of this instruction
+        /// is not in a position where it must create an invalid type.
+        /// Uses the `param_type` union field.
+        param_type,
         /// Turns an R-Value into a const L-Value. In other words, it takes a value,
         /// stores it in a memory location, and returns a const pointer to it. If the value
         /// is `comptime`, the memory location is global static constant data. Otherwise,
@@ -1077,6 +1085,7 @@ pub const Inst = struct {
                 .mul,
                 .mulwrap,
                 .mul_sat,
+                .param_type,
                 .ref,
                 .shl,
                 .shl_sat,
@@ -1266,6 +1275,7 @@ pub const Inst = struct {
                 .mulwrap = .pl_node,
                 .mul_sat = .pl_node,
 
+                .param_type = .param_type,
                 .param = .pl_tok,
                 .param_comptime = .pl_tok,
                 .param_anytype = .str_tok,
@@ -2213,6 +2223,10 @@ pub const Inst = struct {
             /// Points to a `Block`.
             payload_index: u32,
         },
+        param_type: struct {
+            callee: Ref,
+            param_index: u32,
+        },
         @"unreachable": struct {
             /// Offset from Decl AST node index.
             /// `Tag` determines which kind of AST node this points to.
@@ -2288,6 +2302,7 @@ pub const Inst = struct {
             ptr_type,
             int_type,
             bool_br,
+            param_type,
             @"unreachable",
             @"break",
             switch_capture,
@@ -2616,6 +2631,53 @@ pub const Inst = struct {
 
                 return .{
                     .item = item,
+                    .body = body,
+                };
+            }
+        }
+
+        pub const MultiProng = struct {
+            items: []const Ref,
+            body: []const Index,
+        };
+
+        pub fn getMultiProng(
+            self: SwitchBlock,
+            zir: Zir,
+            extra_end: usize,
+            prong_index: usize,
+        ) MultiProng {
+            // +1 for self.bits.has_multi_cases == true
+            var extra_index: usize = extra_end + 1;
+
+            if (self.bits.specialProng() != .none) {
+                const body_len = zir.extra[extra_index];
+                extra_index += 1;
+                const body = zir.extra[extra_index..][0..body_len];
+                extra_index += body.len;
+            }
+
+            var scalar_i: usize = 0;
+            while (scalar_i < self.bits.scalar_cases_len) : (scalar_i += 1) {
+                extra_index += 1;
+                const body_len = zir.extra[extra_index];
+                extra_index += 1;
+                extra_index += body_len;
+            }
+            var multi_i: u32 = 0;
+            while (true) : (multi_i += 1) {
+                const items_len = zir.extra[extra_index];
+                extra_index += 2;
+                const body_len = zir.extra[extra_index];
+                extra_index += 1;
+                const items = zir.refSlice(extra_index, items_len);
+                extra_index += items_len;
+                const body = zir.extra[extra_index..][0..body_len];
+                extra_index += body_len;
+
+                if (multi_i < prong_index) continue;
+                return .{
+                    .items = items,
                     .body = body,
                 };
             }

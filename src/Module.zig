@@ -146,6 +146,8 @@ const MonomorphedFuncsSet = std.HashMapUnmanaged(
 );
 
 const MonomorphedFuncsContext = struct {
+    target: Target,
+
     pub fn eql(ctx: @This(), a: *Fn, b: *Fn) bool {
         _ = ctx;
         return a == b;
@@ -153,7 +155,6 @@ const MonomorphedFuncsContext = struct {
 
     /// Must match `Sema.GenericCallAdapter.hash`.
     pub fn hash(ctx: @This(), key: *Fn) u64 {
-        _ = ctx;
         var hasher = std.hash.Wyhash.init(0);
 
         // The generic function Decl is guaranteed to be the first dependency
@@ -168,12 +169,18 @@ const MonomorphedFuncsContext = struct {
         const generic_ty_info = generic_owner_decl.ty.fnInfo();
         for (generic_ty_info.param_types) |param_ty, i| {
             if (generic_ty_info.paramIsComptime(i) and param_ty.tag() != .generic_poison) {
-                comptime_args[i].val.hash(param_ty, &hasher);
+                comptime_args[i].val.hash(param_ty, &hasher, ctx.target);
             }
         }
 
         return hasher.final();
     }
+};
+
+pub const WipAnalysis = struct {
+    sema: *Sema,
+    block: *Sema.Block,
+    src: Module.LazySrcLoc,
 };
 
 pub const MemoizedCallSet = std.HashMapUnmanaged(
@@ -184,6 +191,8 @@ pub const MemoizedCallSet = std.HashMapUnmanaged(
 );
 
 pub const MemoizedCall = struct {
+    target: std.Target,
+
     pub const Key = struct {
         func: *Fn,
         args: []TypedValue,
@@ -195,14 +204,12 @@ pub const MemoizedCall = struct {
     };
 
     pub fn eql(ctx: @This(), a: Key, b: Key) bool {
-        _ = ctx;
-
         if (a.func != b.func) return false;
 
         assert(a.args.len == b.args.len);
         for (a.args) |a_arg, arg_i| {
             const b_arg = b.args[arg_i];
-            if (!a_arg.eql(b_arg)) {
+            if (!a_arg.eql(b_arg, ctx.target)) {
                 return false;
             }
         }
@@ -212,8 +219,6 @@ pub const MemoizedCall = struct {
 
     /// Must match `Sema.GenericCallAdapter.hash`.
     pub fn hash(ctx: @This(), key: Key) u64 {
-        _ = ctx;
-
         var hasher = std.hash.Wyhash.init(0);
 
         // The generic function Decl is guaranteed to be the first dependency
@@ -223,7 +228,7 @@ pub const MemoizedCall = struct {
         // This logic must be kept in sync with the logic in `analyzeCall` that
         // computes the hash.
         for (key.args) |arg| {
-            arg.hash(&hasher);
+            arg.hash(&hasher, ctx.target);
         }
 
         return hasher.final();
@@ -776,11 +781,11 @@ pub const Decl = struct {
         return &decl_plus_emit_h.emit_h;
     }
 
-    fn removeDependant(decl: *Decl, other: *Decl) void {
+    pub fn removeDependant(decl: *Decl, other: *Decl) void {
         assert(decl.dependants.swapRemove(other));
     }
 
-    fn removeDependency(decl: *Decl, other: *Decl) void {
+    pub fn removeDependency(decl: *Decl, other: *Decl) void {
         assert(decl.dependencies.swapRemove(other));
     }
 
@@ -1226,13 +1231,7 @@ pub const Union = struct {
         for (u.fields.values()) |field, i| {
             if (!field.ty.hasRuntimeBits()) continue;
 
-            const field_align = a: {
-                if (field.abi_align == 0) {
-                    break :a field.ty.abiAlignment(target);
-                } else {
-                    break :a @intCast(u32, field.abi_align.toUnsignedInt());
-                }
-            };
+            const field_align = field.normalAlignment(target);
             if (field_align > most_alignment) {
                 most_alignment = field_align;
                 most_index = i;
@@ -1248,13 +1247,7 @@ pub const Union = struct {
         for (u.fields.values()) |field| {
             if (!field.ty.hasRuntimeBits()) continue;
 
-            const field_align = a: {
-                if (field.abi_align == 0) {
-                    break :a field.ty.abiAlignment(target);
-                } else {
-                    break :a field.abi_align;
-                }
-            };
+            const field_align = field.normalAlignment(target);
             max_align = @maximum(max_align, field_align);
         }
         return max_align;
@@ -1586,6 +1579,19 @@ pub const Var = struct {
     }
 };
 
+pub const DeclAdapter = struct {
+    pub fn hash(self: @This(), s: []const u8) u32 {
+        _ = self;
+        return @truncate(u32, std.hash.Wyhash.hash(0, s));
+    }
+
+    pub fn eql(self: @This(), a: []const u8, b_decl: *Decl, b_index: usize) bool {
+        _ = self;
+        _ = b_index;
+        return mem.eql(u8, a, mem.sliceTo(b_decl.name, 0));
+    }
+};
+
 /// The container that structs, enums, unions, and opaques have.
 pub const Namespace = struct {
     parent: ?*Namespace,
@@ -1596,9 +1602,8 @@ pub const Namespace = struct {
     /// which decls have been added/removed from source.
     /// Declaration order is preserved via entry order.
     /// Key memory is owned by `decl.name`.
-    /// TODO save memory with https://github.com/ziglang/zig/issues/8619.
     /// Anonymous decls are not stored here; they are kept in `anon_decls` instead.
-    decls: std.StringArrayHashMapUnmanaged(*Decl) = .{},
+    decls: std.ArrayHashMapUnmanaged(*Decl, void, DeclContext, true) = .{},
 
     anon_decls: std.AutoArrayHashMapUnmanaged(*Decl, void) = .{},
 
@@ -1606,6 +1611,19 @@ pub const Namespace = struct {
     /// the Decl Value has to be resolved as a Type which has a Namespace.
     /// Value is whether the usingnamespace decl is marked `pub`.
     usingnamespace_set: std.AutoHashMapUnmanaged(*Decl, bool) = .{},
+
+    const DeclContext = struct {
+        pub fn hash(self: @This(), decl: *Decl) u32 {
+            _ = self;
+            return @truncate(u32, std.hash.Wyhash.hash(0, mem.sliceTo(decl.name, 0)));
+        }
+
+        pub fn eql(self: @This(), a: *Decl, b: *Decl, b_index: usize) bool {
+            _ = self;
+            _ = b_index;
+            return mem.eql(u8, mem.sliceTo(a.name, 0), mem.sliceTo(b.name, 0));
+        }
+    };
 
     pub fn deinit(ns: *Namespace, mod: *Module) void {
         ns.destroyDecls(mod);
@@ -1623,8 +1641,8 @@ pub const Namespace = struct {
         var anon_decls = ns.anon_decls;
         ns.anon_decls = .{};
 
-        for (decls.values()) |value| {
-            value.destroy(mod);
+        for (decls.keys()) |decl| {
+            decl.destroy(mod);
         }
         decls.deinit(gpa);
 
@@ -1653,7 +1671,7 @@ pub const Namespace = struct {
         // TODO rework this code to not panic on OOM.
         // (might want to coordinate with the clearDecl function)
 
-        for (decls.values()) |child_decl| {
+        for (decls.keys()) |child_decl| {
             mod.clearDecl(child_decl, outdated_decls) catch @panic("out of memory");
             child_decl.destroy(mod);
         }
@@ -3320,7 +3338,7 @@ fn updateZirRefs(gpa: Allocator, file: *File, old_zir: Zir) !void {
         }
 
         if (decl.getInnerNamespace()) |namespace| {
-            for (namespace.decls.values()) |sub_decl| {
+            for (namespace.decls.keys()) |sub_decl| {
                 try decl_stack.append(gpa, sub_decl);
             }
             for (namespace.anon_decls.keys()) |sub_decl| {
@@ -3877,6 +3895,7 @@ fn semaDecl(mod: *Module, decl: *Decl) !bool {
         const bytes = try sema.resolveConstString(&block_scope, src, linksection_ref);
         break :blk (try decl_arena_allocator.dupeZ(u8, bytes)).ptr;
     };
+    const target = sema.mod.getTarget();
     const address_space = blk: {
         const addrspace_ctx: Sema.AddressSpaceContext = switch (decl_tv.val.tag()) {
             .function, .extern_fn => .function,
@@ -3886,9 +3905,9 @@ fn semaDecl(mod: *Module, decl: *Decl) !bool {
 
         break :blk switch (decl.zirAddrspaceRef()) {
             .none => switch (addrspace_ctx) {
-                .function => target_util.defaultAddressSpace(sema.mod.getTarget(), .function),
-                .variable => target_util.defaultAddressSpace(sema.mod.getTarget(), .global_mutable),
-                .constant => target_util.defaultAddressSpace(sema.mod.getTarget(), .global_constant),
+                .function => target_util.defaultAddressSpace(target, .function),
+                .variable => target_util.defaultAddressSpace(target, .global_mutable),
+                .constant => target_util.defaultAddressSpace(target, .global_constant),
                 else => unreachable,
             },
             else => |addrspace_ref| try sema.analyzeAddrspace(&block_scope, src, addrspace_ref, addrspace_ctx),
@@ -3898,19 +3917,21 @@ fn semaDecl(mod: *Module, decl: *Decl) !bool {
     // Note this resolves the type of the Decl, not the value; if this Decl
     // is a struct, for example, this resolves `type` (which needs no resolution),
     // not the struct itself.
-    try sema.resolveTypeFully(&block_scope, src, decl_tv.ty);
+    try sema.resolveTypeLayout(&block_scope, src, decl_tv.ty);
 
     const decl_arena_state = try decl_arena_allocator.create(std.heap.ArenaAllocator.State);
 
     if (decl.is_usingnamespace) {
         const ty_ty = Type.initTag(.type);
-        if (!decl_tv.ty.eql(ty_ty)) {
-            return sema.fail(&block_scope, src, "expected type, found {}", .{decl_tv.ty});
+        if (!decl_tv.ty.eql(ty_ty, target)) {
+            return sema.fail(&block_scope, src, "expected type, found {}", .{
+                decl_tv.ty.fmt(target),
+            });
         }
         var buffer: Value.ToTypeBuffer = undefined;
         const ty = decl_tv.val.toType(&buffer);
         if (ty.getNamespace() == null) {
-            return sema.fail(&block_scope, src, "type {} has no namespace", .{ty});
+            return sema.fail(&block_scope, src, "type {} has no namespace", .{ty.fmt(target)});
         }
 
         decl.ty = ty_ty;
@@ -3937,7 +3958,7 @@ fn semaDecl(mod: *Module, decl: *Decl) !bool {
 
             if (decl.has_tv) {
                 prev_type_has_bits = decl.ty.isFnOrHasRuntimeBits();
-                type_changed = !decl.ty.eql(decl_tv.ty);
+                type_changed = !decl.ty.eql(decl_tv.ty, target);
                 if (decl.getFunction()) |prev_func| {
                     prev_is_inline = prev_func.state == .inline_only;
                 }
@@ -3986,7 +4007,7 @@ fn semaDecl(mod: *Module, decl: *Decl) !bool {
     }
     var type_changed = true;
     if (decl.has_tv) {
-        type_changed = !decl.ty.eql(decl_tv.ty);
+        type_changed = !decl.ty.eql(decl_tv.ty, target);
         decl.clearValues(gpa);
     }
 
@@ -4040,6 +4061,10 @@ fn semaDecl(mod: *Module, decl: *Decl) !bool {
 
     if (has_runtime_bits) {
         log.debug("queue linker work for {*} ({s})", .{ decl, decl.name });
+
+        // Needed for codegen_decl which will call updateDecl and then the
+        // codegen backend wants full access to the Decl Type.
+        try sema.resolveTypeFully(&block_scope, src, decl.ty);
 
         try mod.comp.bin_file.allocateDeclIndexes(decl);
         try mod.comp.work_queue.writeItem(.{ .codegen_decl = decl });
@@ -4408,7 +4433,7 @@ fn scanDecl(iter: *ScanDeclIter, decl_sub_index: usize, flags: u4) SemaError!voi
     if (is_usingnamespace) try namespace.usingnamespace_set.ensureUnusedCapacity(gpa, 1);
 
     // We create a Decl for it regardless of analysis status.
-    const gop = try namespace.decls.getOrPut(gpa, decl_name);
+    const gop = try namespace.decls.getOrPutAdapted(gpa, @as([]const u8, mem.sliceTo(decl_name, 0)), DeclAdapter{});
     if (!gop.found_existing) {
         const new_decl = try mod.allocateNewDecl(decl_name, namespace, decl_node, iter.parent_decl.src_scope);
         if (is_usingnamespace) {
@@ -4416,7 +4441,7 @@ fn scanDecl(iter: *ScanDeclIter, decl_sub_index: usize, flags: u4) SemaError!voi
         }
         log.debug("scan new {*} ({s}) into {*}", .{ new_decl, decl_name, namespace });
         new_decl.src_line = line;
-        gop.value_ptr.* = new_decl;
+        gop.key_ptr.* = new_decl;
         // Exported decls, comptime decls, usingnamespace decls, and
         // test decls if in test mode, get analyzed.
         const decl_pkg = namespace.file_scope.pkg;
@@ -4452,7 +4477,7 @@ fn scanDecl(iter: *ScanDeclIter, decl_sub_index: usize, flags: u4) SemaError!voi
         return;
     }
     gpa.free(decl_name);
-    const decl = gop.value_ptr.*;
+    const decl = gop.key_ptr.*;
     log.debug("scan existing {*} ({s}) of {*}", .{ decl, decl.name, namespace });
     // Update the AST node of the decl; even if its contents are unchanged, it may
     // have been re-ordered.
@@ -4829,6 +4854,9 @@ pub fn analyzeFnBody(mod: *Module, decl: *Decl, func: *Fn, arena: Allocator) Sem
 
     // Finally we must resolve the return type and parameter types so that backends
     // have full access to type information.
+    // Crucially, this happens *after* we set the function state to success above,
+    // so that dependencies on the function body will now be satisfied rather than
+    // result in circular dependency errors.
     const src: LazySrcLoc = .{ .node_offset = 0 };
     sema.resolveFnTypes(&inner_block, src, fn_ty_info) catch |err| switch (err) {
         error.NeededSourceLocation => unreachable,
@@ -4838,6 +4866,20 @@ pub fn analyzeFnBody(mod: *Module, decl: *Decl, func: *Fn, arena: Allocator) Sem
         error.AnalysisFail => {},
         else => |e| return e,
     };
+
+    // Similarly, resolve any queued up types that were requested to be resolved for
+    // the backends.
+    for (sema.types_to_resolve.items) |inst_ref| {
+        const ty = sema.getTmpAir().getRefType(inst_ref);
+        sema.resolveTypeFully(&inner_block, src, ty) catch |err| switch (err) {
+            error.NeededSourceLocation => unreachable,
+            error.GenericPoison => unreachable,
+            error.ComptimeReturn => unreachable,
+            error.ComptimeBreak => unreachable,
+            error.AnalysisFail => {},
+            else => |e| return e,
+        };
+    }
 
     return Air{
         .instructions = sema.air_instructions.toOwnedSlice(),
@@ -5052,22 +5094,6 @@ pub fn errNoteNonLazy(
         .src_loc = src_loc,
         .msg = msg,
     };
-}
-
-pub fn errorUnionType(
-    arena: Allocator,
-    error_set: Type,
-    payload: Type,
-) Allocator.Error!Type {
-    assert(error_set.zigTypeTag() == .ErrorSet);
-    if (error_set.eql(Type.initTag(.anyerror)) and payload.eql(Type.initTag(.void))) {
-        return Type.initTag(.anyerror_void_error_union);
-    }
-
-    return Type.Tag.error_union.create(arena, .{
-        .error_set = error_set,
-        .payload = payload,
-    });
 }
 
 pub fn getTarget(mod: Module) Target {
@@ -5320,7 +5346,7 @@ pub fn processOutdatedAndDeletedDecls(mod: *Module) !void {
 
             // Remove from the namespace it resides in, preserving declaration order.
             assert(decl.zir_decl_index != 0);
-            _ = decl.src_namespace.decls.orderedRemove(mem.sliceTo(decl.name, 0));
+            _ = decl.src_namespace.decls.orderedRemoveAdapted(@as([]const u8, mem.sliceTo(decl.name, 0)), DeclAdapter{});
 
             try mod.clearDecl(decl, &outdated_decls);
             decl.destroy(mod);
@@ -5387,7 +5413,7 @@ pub fn populateTestFunctions(mod: *Module) !void {
     const builtin_pkg = mod.main_pkg.table.get("builtin").?;
     const builtin_file = (mod.importPkg(builtin_pkg) catch unreachable).file;
     const builtin_namespace = builtin_file.root_decl.?.src_namespace;
-    const decl = builtin_namespace.decls.get("test_functions").?;
+    const decl = builtin_namespace.decls.getKeyAdapted(@as([]const u8, "test_functions"), DeclAdapter{}).?;
     var buf: Type.SlicePtrFieldTypeBuffer = undefined;
     const tmp_test_fn_ty = decl.ty.slicePtrFieldType(&buf).elemType();
 

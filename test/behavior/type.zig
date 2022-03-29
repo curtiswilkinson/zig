@@ -260,6 +260,13 @@ test "Type.ErrorSet" {
             .{ .name = "C" },
         },
     });
+    _ = @Type(.{
+        .ErrorSet = &.{
+            .{ .name = "C" },
+            .{ .name = "B" },
+            .{ .name = "A" },
+        },
+    });
 }
 
 test "Type.Struct" {
@@ -353,7 +360,6 @@ test "Type.Struct" {
 }
 
 test "Type.Enum" {
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
@@ -465,7 +471,6 @@ test "Type.Union" {
 }
 
 test "Type.Union from Type.Enum" {
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
@@ -496,7 +501,6 @@ test "Type.Union from Type.Enum" {
 }
 
 test "Type.Union from regular enum" {
-    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO

@@ -1,26 +1,25 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const builtin = @import("builtin");
+const assert = std.debug.assert;
+const leb128 = std.leb;
+const link = @import("link.zig");
+const log = std.log.scoped(.codegen);
 const mem = std.mem;
 const math = std.math;
-const assert = std.debug.assert;
+const trace = @import("tracy.zig").trace;
+
 const Air = @import("Air.zig");
-const Zir = @import("Zir.zig");
-const Liveness = @import("Liveness.zig");
-const Type = @import("type.zig").Type;
-const Value = @import("value.zig").Value;
-const TypedValue = @import("TypedValue.zig");
-const link = @import("link.zig");
-const Module = @import("Module.zig");
+const Allocator = mem.Allocator;
 const Compilation = @import("Compilation.zig");
 const ErrorMsg = Module.ErrorMsg;
+const Liveness = @import("Liveness.zig");
+const Module = @import("Module.zig");
 const Target = std.Target;
-const Allocator = mem.Allocator;
-const trace = @import("tracy.zig").trace;
-const DW = std.dwarf;
-const leb128 = std.leb;
-const log = std.log.scoped(.codegen);
-const build_options = @import("build_options");
-const RegisterManager = @import("register_manager.zig").RegisterManager;
+const Type = @import("type.zig").Type;
+const TypedValue = @import("TypedValue.zig");
+const Value = @import("value.zig").Value;
+const Zir = @import("Zir.zig");
 
 pub const FnResult = union(enum) {
     /// The `code` parameter passed to `generateSymbol` has the value appended.
@@ -43,11 +42,7 @@ pub const GenerateSymbolError = error{
 };
 
 pub const DebugInfoOutput = union(enum) {
-    dwarf: struct {
-        dbg_line: *std.ArrayList(u8),
-        dbg_info: *std.ArrayList(u8),
-        dbg_info_type_relocs: *link.File.DbgInfoTypeRelocsTable,
-    },
+    dwarf: *link.File.Dwarf,
     /// the plan9 debuginfo output is a bytecode with 4 opcodes
     /// assume all numbers/variables are bytes
     /// 0 w x y z -> interpret w x y z as a big-endian i32, and add it to the line offset
@@ -165,7 +160,10 @@ pub fn generateSymbol(
     const target = bin_file.options.target;
     const endian = target.cpu.arch.endian();
 
-    log.debug("generateSymbol: ty = {}, val = {}", .{ typed_value.ty, typed_value.val.fmtDebug() });
+    log.debug("generateSymbol: ty = {}, val = {}", .{
+        typed_value.ty.fmtDebug(),
+        typed_value.val.fmtDebug(),
+    });
 
     if (typed_value.val.isUndefDeep()) {
         const abi_size = try math.cast(usize, typed_value.ty.abiSize(target));
@@ -295,11 +293,11 @@ pub fn generateSymbol(
             .zero, .one, .int_u64, .int_big_positive => {
                 switch (target.cpu.arch.ptrBitWidth()) {
                     32 => {
-                        const x = typed_value.val.toUnsignedInt();
+                        const x = typed_value.val.toUnsignedInt(target);
                         mem.writeInt(u32, try code.addManyAsArray(4), @intCast(u32, x), endian);
                     },
                     64 => {
-                        const x = typed_value.val.toUnsignedInt();
+                        const x = typed_value.val.toUnsignedInt(target);
                         mem.writeInt(u64, try code.addManyAsArray(8), x, endian);
                     },
                     else => unreachable,
@@ -433,7 +431,7 @@ pub fn generateSymbol(
             // TODO populate .debug_info for the integer
             const info = typed_value.ty.intInfo(bin_file.options.target);
             if (info.bits <= 8) {
-                const x = @intCast(u8, typed_value.val.toUnsignedInt());
+                const x = @intCast(u8, typed_value.val.toUnsignedInt(target));
                 try code.append(x);
                 return Result{ .appended = {} };
             }
@@ -443,20 +441,20 @@ pub fn generateSymbol(
                         bin_file.allocator,
                         src_loc,
                         "TODO implement generateSymbol for big ints ('{}')",
-                        .{typed_value.ty},
+                        .{typed_value.ty.fmtDebug()},
                     ),
                 };
             }
             switch (info.signedness) {
                 .unsigned => {
                     if (info.bits <= 16) {
-                        const x = @intCast(u16, typed_value.val.toUnsignedInt());
+                        const x = @intCast(u16, typed_value.val.toUnsignedInt(target));
                         mem.writeInt(u16, try code.addManyAsArray(2), x, endian);
                     } else if (info.bits <= 32) {
-                        const x = @intCast(u32, typed_value.val.toUnsignedInt());
+                        const x = @intCast(u32, typed_value.val.toUnsignedInt(target));
                         mem.writeInt(u32, try code.addManyAsArray(4), x, endian);
                     } else {
-                        const x = typed_value.val.toUnsignedInt();
+                        const x = typed_value.val.toUnsignedInt(target);
                         mem.writeInt(u64, try code.addManyAsArray(8), x, endian);
                     }
                 },
@@ -476,13 +474,12 @@ pub fn generateSymbol(
             return Result{ .appended = {} };
         },
         .Enum => {
-            // TODO populate .debug_info for the enum
             var int_buffer: Value.Payload.U64 = undefined;
             const int_val = typed_value.enumToInt(&int_buffer);
 
             const info = typed_value.ty.intInfo(target);
             if (info.bits <= 8) {
-                const x = @intCast(u8, int_val.toUnsignedInt());
+                const x = @intCast(u8, int_val.toUnsignedInt(target));
                 try code.append(x);
                 return Result{ .appended = {} };
             }
@@ -492,20 +489,20 @@ pub fn generateSymbol(
                         bin_file.allocator,
                         src_loc,
                         "TODO implement generateSymbol for big int enums ('{}')",
-                        .{typed_value.ty},
+                        .{typed_value.ty.fmtDebug()},
                     ),
                 };
             }
             switch (info.signedness) {
                 .unsigned => {
                     if (info.bits <= 16) {
-                        const x = @intCast(u16, int_val.toUnsignedInt());
+                        const x = @intCast(u16, int_val.toUnsignedInt(target));
                         mem.writeInt(u16, try code.addManyAsArray(2), x, endian);
                     } else if (info.bits <= 32) {
-                        const x = @intCast(u32, int_val.toUnsignedInt());
+                        const x = @intCast(u32, int_val.toUnsignedInt(target));
                         mem.writeInt(u32, try code.addManyAsArray(4), x, endian);
                     } else {
-                        const x = int_val.toUnsignedInt();
+                        const x = int_val.toUnsignedInt(target);
                         mem.writeInt(u64, try code.addManyAsArray(8), x, endian);
                     }
                 },
@@ -571,7 +568,6 @@ pub fn generateSymbol(
             return Result{ .appended = {} };
         },
         .Union => {
-            // TODO generate debug info for unions
             const union_obj = typed_value.val.castTag(.@"union").?.data;
             const layout = typed_value.ty.unionGetLayout(target);
 
@@ -597,7 +593,7 @@ pub fn generateSymbol(
             }
 
             const union_ty = typed_value.ty.cast(Type.Payload.Union).?.data;
-            const field_index = union_ty.tag_ty.enumTagFieldIndex(union_obj.tag).?;
+            const field_index = union_ty.tag_ty.enumTagFieldIndex(union_obj.tag, target).?;
             assert(union_ty.haveFieldTypes());
             const field_ty = union_ty.fields.values()[field_index].ty;
             if (!field_ty.hasRuntimeBits()) {
@@ -693,7 +689,6 @@ pub fn generateSymbol(
             return Result{ .appended = {} };
         },
         .ErrorUnion => {
-            // TODO generate debug info for error unions
             const error_ty = typed_value.ty.errorUnionSet();
             const payload_ty = typed_value.ty.errorUnionPayload();
             const is_payload = typed_value.val.errorUnionIsPayload();
@@ -747,7 +742,6 @@ pub fn generateSymbol(
             return Result{ .appended = {} };
         },
         .ErrorSet => {
-            // TODO generate debug info for error sets
             switch (typed_value.val.tag()) {
                 .@"error" => {
                     const name = typed_value.val.getError().?;
@@ -787,6 +781,7 @@ fn lowerDeclRef(
     debug_output: DebugInfoOutput,
     reloc_info: RelocInfo,
 ) GenerateSymbolError!Result {
+    const target = bin_file.options.target;
     if (typed_value.ty.isSlice()) {
         // generate ptr
         var buf: Type.SlicePtrFieldTypeBuffer = undefined;
@@ -805,7 +800,7 @@ fn lowerDeclRef(
         // generate length
         var slice_len: Value.Payload.U64 = .{
             .base = .{ .tag = .int_u64 },
-            .data = typed_value.val.sliceLen(),
+            .data = typed_value.val.sliceLen(target),
         };
         switch (try generateSymbol(bin_file, src_loc, .{
             .ty = Type.usize,
@@ -821,7 +816,6 @@ fn lowerDeclRef(
         return Result{ .appended = {} };
     }
 
-    const target = bin_file.options.target;
     const ptr_width = target.cpu.arch.ptrBitWidth();
     const is_fn_body = decl.ty.zigTypeTag() == .Fn;
     if (!is_fn_body and !decl.ty.hasRuntimeBits()) {
