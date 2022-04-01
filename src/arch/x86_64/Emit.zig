@@ -145,6 +145,7 @@ pub fn lowerMir(emit: *Emit) InnerError!void {
             .sar => try emit.mirShift(.sar, inst),
 
             .imul => try emit.mirMulDiv(.imul, inst),
+            .mul => try emit.mirMulDiv(.mul, inst),
             .idiv => try emit.mirMulDiv(.idiv, inst),
             .div => try emit.mirMulDiv(.div, inst),
             .imul_complex => try emit.mirIMulComplex(inst),
@@ -976,7 +977,7 @@ fn dbgAdvancePCAndLine(emit: *Emit, line: u32, column: u32) InnerError!void {
             // TODO Look into using the DWARF special opcodes to compress this data.
             // It lets you emit single-byte opcodes that add different numbers to
             // both the PC and the line number at the same time.
-            const dbg_line = dw.getDeclDebugLineBuffer();
+            const dbg_line = &dw.dbg_line;
             try dbg_line.ensureUnusedCapacity(11);
             dbg_line.appendAssumeCapacity(DW.LNS.advance_pc);
             leb128.writeULEB128(dbg_line.writer(), delta_pc) catch unreachable;
@@ -1033,7 +1034,7 @@ fn mirDbgPrologueEnd(emit: *Emit, inst: Mir.Inst.Index) InnerError!void {
     assert(tag == .dbg_prologue_end);
     switch (emit.debug_output) {
         .dwarf => |dw| {
-            try dw.getDeclDebugLineBuffer().append(DW.LNS.set_prologue_end);
+            try dw.dbg_line.append(DW.LNS.set_prologue_end);
             log.debug("mirDbgPrologueEnd (line={d}, col={d})", .{ emit.prev_di_line, emit.prev_di_column });
             try emit.dbgAdvancePCAndLine(emit.prev_di_line, emit.prev_di_column);
         },
@@ -1047,7 +1048,7 @@ fn mirDbgEpilogueBegin(emit: *Emit, inst: Mir.Inst.Index) InnerError!void {
     assert(tag == .dbg_epilogue_begin);
     switch (emit.debug_output) {
         .dwarf => |dw| {
-            try dw.getDeclDebugLineBuffer().append(DW.LNS.set_epilogue_begin);
+            try dw.dbg_line.append(DW.LNS.set_epilogue_begin);
             log.debug("mirDbgEpilogueBegin (line={d}, col={d})", .{ emit.prev_di_line, emit.prev_di_column });
             try emit.dbgAdvancePCAndLine(emit.prev_di_line, emit.prev_di_column);
         },
@@ -1074,7 +1075,7 @@ fn genArgDbgInfo(emit: *Emit, inst: Air.Inst.Index, mcv: MCValue, max_stack: u32
         .register => |reg| {
             switch (emit.debug_output) {
                 .dwarf => |dw| {
-                    const dbg_info = dw.getDeclDebugInfoBuffer();
+                    const dbg_info = &dw.dbg_info;
                     try dbg_info.ensureUnusedCapacity(3);
                     dbg_info.appendAssumeCapacity(link.File.Dwarf.abbrev_parameter);
                     dbg_info.appendSliceAssumeCapacity(&[2]u8{ // DW.AT.location, DW.FORM.exprloc
@@ -1098,7 +1099,7 @@ fn genArgDbgInfo(emit: *Emit, inst: Air.Inst.Index, mcv: MCValue, max_stack: u32
                     // TODO we need to make this more generic if we don't use rbp as the frame pointer
                     // for example when -fomit-frame-pointer is set.
                     const disp = @intCast(i32, max_stack) - off + 16;
-                    const dbg_info = dw.getDeclDebugInfoBuffer();
+                    const dbg_info = &dw.dbg_info;
                     try dbg_info.ensureUnusedCapacity(8);
                     dbg_info.appendAssumeCapacity(link.File.Dwarf.abbrev_parameter);
                     const fixup = dbg_info.items.len;
@@ -1127,7 +1128,7 @@ fn addDbgInfoTypeReloc(emit: *Emit, ty: Type) !void {
     switch (emit.debug_output) {
         .dwarf => |dw| {
             assert(ty.hasRuntimeBits());
-            const dbg_info = dw.getDeclDebugInfoBuffer();
+            const dbg_info = &dw.dbg_info;
             const index = dbg_info.items.len;
             try dbg_info.resize(index + 4); // DW.AT.type,  DW.FORM.ref4
             const atom = switch (emit.bin_file.tag) {
@@ -1164,6 +1165,7 @@ const Tag = enum {
     brk,
     nop,
     imul,
+    mul,
     idiv,
     div,
     syscall,
@@ -1411,7 +1413,7 @@ inline fn getOpCode(tag: Tag, enc: Encoding, is_one_byte: bool) ?OpCode {
             .setnl, .setge => OpCode.twoByte(0x0f, 0x9d),
             .setle, .setng => OpCode.twoByte(0x0f, 0x9e),
             .setnle, .setg => OpCode.twoByte(0x0f, 0x9f),
-            .idiv, .div, .imul => OpCode.oneByte(if (is_one_byte) 0xf6 else 0xf7),
+            .idiv, .div, .imul, .mul => OpCode.oneByte(if (is_one_byte) 0xf6 else 0xf7),
             .fisttp16 => OpCode.oneByte(0xdf),
             .fisttp32 => OpCode.oneByte(0xdb),
             .fisttp64 => OpCode.oneByte(0xdd),
@@ -1554,9 +1556,10 @@ inline fn getModRmExt(tag: Tag) ?u3 {
         => 0x4,
         .shr => 0x5,
         .sar => 0x7,
+        .mul => 0x4,
         .imul => 0x5,
-        .idiv => 0x7,
         .div => 0x6,
+        .idiv => 0x7,
         .fisttp16 => 0x1,
         .fisttp32 => 0x1,
         .fisttp64 => 0x1,

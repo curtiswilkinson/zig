@@ -1319,7 +1319,9 @@ fn genInst(self: *Self, inst: Air.Inst.Index) !WValue {
         .cmp_lte => self.airCmp(inst, .lte),
         .cmp_lt => self.airCmp(inst, .lt),
         .cmp_neq => self.airCmp(inst, .neq),
+
         .cmp_vector => self.airCmpVector(inst),
+        .cmp_lt_errors_len => self.airCmpLtErrorsLen(inst),
 
         .array_elem_val => self.airArrayElemVal(inst),
         .array_to_slice => self.airArrayToSlice(inst),
@@ -2267,6 +2269,16 @@ fn airCmpVector(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
     return self.fail("TODO implement airCmpVector for wasm", .{});
 }
 
+fn airCmpLtErrorsLen(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
+    if (self.liveness.isUnused(inst)) return WValue{ .none = {} };
+
+    const un_op = self.air.instructions.items(.data)[inst].un_op;
+    const operand = try self.resolveInst(un_op);
+
+    _ = operand;
+    return self.fail("TODO implement airCmpLtErrorsLen for wasm", .{});
+}
+
 fn airBr(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
     const br = self.air.instructions.items(.data)[inst].br;
     const block = self.blocks.get(br.block_inst).?;
@@ -2615,12 +2627,12 @@ fn airWrapErrUnionPayload(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
 
     const op_ty = self.air.typeOf(ty_op.operand);
     if (!op_ty.hasRuntimeBitsIgnoreComptime()) return operand;
-    const err_ty = self.air.getRefType(ty_op.ty);
-    const err_align = err_ty.abiAlignment(self.target);
-    const set_size = err_ty.errorUnionSet().abiSize(self.target);
+    const err_union_ty = self.air.getRefType(ty_op.ty);
+    const err_align = err_union_ty.abiAlignment(self.target);
+    const set_size = err_union_ty.errorUnionSet().abiSize(self.target);
     const offset = mem.alignForwardGeneric(u64, set_size, err_align);
 
-    const err_union = try self.allocStack(err_ty);
+    const err_union = try self.allocStack(err_union_ty);
     const payload_ptr = try self.buildPointerOffset(err_union, offset, .new);
     try self.store(payload_ptr, operand, op_ty, 0);
 

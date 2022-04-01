@@ -440,8 +440,38 @@ pub const Object = struct {
         error_name_table_ptr_global.setInitializer(error_name_table_ptr);
     }
 
+    fn genCmpLtErrorsLenFunction(object: *Object, comp: *Compilation) !void {
+        // If there is no such function in the module, it means the source code does not need it.
+        const llvm_fn = object.llvm_module.getNamedFunction(lt_errors_fn_name) orelse return;
+        const mod = comp.bin_file.options.module.?;
+        const errors_len = mod.global_error_set.count();
+
+        // Delete previous implementation. We replace it with every flush() because the
+        // total number of errors may have changed.
+        while (llvm_fn.getFirstBasicBlock()) |bb| {
+            bb.deleteBasicBlock();
+        }
+
+        const builder = object.context.createBuilder();
+
+        const entry_block = object.context.appendBasicBlock(llvm_fn, "Entry");
+        builder.positionBuilderAtEnd(entry_block);
+        builder.clearCurrentDebugLocation();
+
+        // Example source of the following LLVM IR:
+        // fn __zig_lt_errors_len(index: u16) bool {
+        //     return index < total_errors_len;
+        // }
+
+        const lhs = llvm_fn.getParam(0);
+        const rhs = lhs.typeOf().constInt(errors_len, .False);
+        const is_lt = builder.buildICmp(.ULT, lhs, rhs, "");
+        _ = builder.buildRet(is_lt);
+    }
+
     pub fn flushModule(self: *Object, comp: *Compilation) !void {
         try self.genErrorNameTable(comp);
+        try self.genCmpLtErrorsLenFunction(comp);
 
         if (self.di_builder) |dib| {
             // When lowering debug info for pointers, we emitted the element types as
@@ -3457,7 +3487,9 @@ pub const FuncGen = struct {
                 .cmp_lt  => try self.airCmp(inst, .lt),
                 .cmp_lte => try self.airCmp(inst, .lte),
                 .cmp_neq => try self.airCmp(inst, .neq),
+
                 .cmp_vector => try self.airCmpVector(inst),
+                .cmp_lt_errors_len => try self.airCmpLtErrorsLen(inst),
 
                 .is_non_null     => try self.airIsNonNull(inst, false, false, .NE),
                 .is_non_null_ptr => try self.airIsNonNull(inst, true , false, .NE),
@@ -3736,6 +3768,16 @@ pub const FuncGen = struct {
         const cmp_op = extra.compareOperator();
 
         return self.cmp(lhs, rhs, vec_ty, cmp_op);
+    }
+
+    fn airCmpLtErrorsLen(self: *FuncGen, inst: Air.Inst.Index) !?*const llvm.Value {
+        if (self.liveness.isUnused(inst)) return null;
+
+        const un_op = self.air.instructions.items(.data)[inst].un_op;
+        const operand = try self.resolveInst(un_op);
+        const llvm_fn = try self.getCmpLtErrorsLenFunction();
+        const args: [1]*const llvm.Value = .{operand};
+        return self.builder.buildCall(llvm_fn, &args, args.len, .Fast, .Auto, "");
     }
 
     fn cmp(
@@ -4503,11 +4545,14 @@ pub const FuncGen = struct {
             total_i += 1;
         }
 
+        const input_start_extra_i = extra_i;
         for (inputs) |input| {
-            const constraint = std.mem.sliceTo(std.mem.sliceAsBytes(self.air.extra[extra_i..]), 0);
+            const input_bytes = std.mem.sliceAsBytes(self.air.extra[extra_i..]);
+            const constraint = std.mem.sliceTo(input_bytes, 0);
+            const input_name = std.mem.sliceTo(input_bytes[constraint.len + 1 ..], 0);
             // This equation accounts for the fact that even if we have exactly 4 bytes
             // for the string, we still use the next u32 for the null terminator.
-            extra_i += constraint.len / 4 + 1;
+            extra_i += (constraint.len + input_name.len + 1) / 4 + 1;
 
             const arg_llvm_value = try self.resolveInst(input);
 
@@ -4549,11 +4594,12 @@ pub const FuncGen = struct {
         var rendered_template = std.ArrayList(u8).init(self.gpa);
         defer rendered_template.deinit();
 
-        const State = enum { start, percent };
+        const State = enum { start, percent, input };
 
         var state: State = .start;
 
-        for (asm_source) |byte| {
+        var name_start: usize = undefined;
+        for (asm_source) |byte, i| {
             switch (state) {
                 .start => switch (byte) {
                     '%' => state = .percent,
@@ -4564,11 +4610,38 @@ pub const FuncGen = struct {
                         try rendered_template.append('%');
                         state = .start;
                     },
+                    '[' => {
+                        try rendered_template.append('$');
+                        name_start = i + 1;
+                        state = .input;
+                    },
                     else => {
                         try rendered_template.append('%');
                         try rendered_template.append(byte);
                         state = .start;
                     },
+                },
+                .input => switch (byte) {
+                    ']' => {
+                        const name = asm_source[name_start..i];
+                        state = .start;
+
+                        extra_i = input_start_extra_i;
+                        for (inputs) |_, input_i| {
+                            const input_bytes = std.mem.sliceAsBytes(self.air.extra[extra_i..]);
+                            const constraint = std.mem.sliceTo(input_bytes, 0);
+                            const input_name = std.mem.sliceTo(input_bytes[constraint.len + 1 ..], 0);
+                            extra_i += (constraint.len + input_name.len + 1) / 4 + 1;
+
+                            if (std.mem.eql(u8, name, input_name)) {
+                                try rendered_template.writer().print("{d}", .{input_i});
+                                break;
+                            }
+                        } else {
+                            return self.todo("TODO validate asm in Sema", .{});
+                        }
+                    },
+                    else => {},
                 },
             }
         }
@@ -6392,6 +6465,25 @@ pub const FuncGen = struct {
         return fn_val;
     }
 
+    fn getCmpLtErrorsLenFunction(self: *FuncGen) !*const llvm.Value {
+        if (self.dg.object.llvm_module.getNamedFunction(lt_errors_fn_name)) |llvm_fn| {
+            return llvm_fn;
+        }
+
+        // Function signature: fn (anyerror) bool
+
+        const ret_llvm_ty = try self.dg.llvmType(Type.bool);
+        const anyerror_llvm_ty = try self.dg.llvmType(Type.anyerror);
+        const param_types = [_]*const llvm.Type{anyerror_llvm_ty};
+
+        const fn_type = llvm.functionType(ret_llvm_ty, &param_types, param_types.len, .False);
+        const llvm_fn = self.dg.object.llvm_module.addFunction(lt_errors_fn_name, fn_type);
+        llvm_fn.setLinkage(.Internal);
+        llvm_fn.setFunctionCallConv(.Fast);
+        self.dg.addCommonFnAttributes(llvm_fn);
+        return llvm_fn;
+    }
+
     fn airErrorName(self: *FuncGen, inst: Air.Inst.Index) !?*const llvm.Value {
         if (self.liveness.isUnused(inst)) return null;
 
@@ -7663,3 +7755,5 @@ const AnnotatedDITypePtr = enum(usize) {
         return @truncate(u1, @enumToInt(self)) != 0;
     }
 };
+
+const lt_errors_fn_name = "__zig_lt_errors_len";

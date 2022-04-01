@@ -4671,22 +4671,6 @@ const GenericCallAdapter = struct {
     }
 };
 
-const GenericRemoveAdapter = struct {
-    precomputed_hash: u64,
-
-    pub fn eql(ctx: @This(), adapted_key: *Module.Fn, other_key: *Module.Fn) bool {
-        _ = ctx;
-        return adapted_key == other_key;
-    }
-
-    /// The implementation of the hash is in semantic analysis of function calls, so
-    /// that any errors when computing the hash can be properly reported.
-    pub fn hash(ctx: @This(), adapted_key: *Module.Fn) u64 {
-        _ = adapted_key;
-        return ctx.precomputed_hash;
-    }
-};
-
 fn analyzeCall(
     sema: *Sema,
     block: *Block,
@@ -4764,12 +4748,20 @@ fn analyzeCall(
 
     const gpa = sema.gpa;
 
-    var is_comptime_call = block.is_comptime or modifier == .compile_time or
-        try sema.typeRequiresComptime(block, func_src, func_ty_info.return_type);
+    var is_generic_call = func_ty_info.is_generic;
+    var is_comptime_call = block.is_comptime or modifier == .compile_time;
+    if (!is_comptime_call) {
+        if (sema.typeRequiresComptime(block, func_src, func_ty_info.return_type)) |ct| {
+            is_comptime_call = ct;
+        } else |err| switch (err) {
+            error.GenericPoison => is_generic_call = true,
+            else => |e| return e,
+        }
+    }
     var is_inline_call = is_comptime_call or modifier == .always_inline or
         func_ty_info.cc == .Inline;
 
-    if (!is_inline_call and func_ty_info.is_generic) {
+    if (!is_inline_call and is_generic_call) {
         if (sema.instantiateGenericCall(
             block,
             func,
@@ -5192,15 +5184,15 @@ fn instantiateGenericCall(
         .comptime_tvs = comptime_tvs,
         .target = target,
     };
-    const gop = try mod.monomorphed_funcs.getOrPutContextAdapted(gpa, {}, adapter, .{ .target = target });
+    const gop = try mod.monomorphed_funcs.getOrPutAdapted(gpa, {}, adapter);
     const callee = if (!gop.found_existing) callee: {
         const new_module_func = try gpa.create(Module.Fn);
+        // This ensures that we can operate on the hash map before the Module.Fn
+        // struct is fully initialized.
+        new_module_func.hash = precomputed_hash;
         gop.key_ptr.* = new_module_func;
         errdefer gpa.destroy(new_module_func);
-        const remove_adapter: GenericRemoveAdapter = .{
-            .precomputed_hash = precomputed_hash,
-        };
-        errdefer assert(mod.monomorphed_funcs.removeAdapted(new_module_func, remove_adapter));
+        errdefer assert(mod.monomorphed_funcs.remove(new_module_func));
 
         try namespace.anon_decls.ensureUnusedCapacity(gpa, 1);
 
@@ -5632,7 +5624,7 @@ fn zirErrorToInt(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
     const operand_src: LazySrcLoc = .{ .node_offset_builtin_call_arg0 = inst_data.src_node };
     const op = sema.resolveInst(inst_data.operand);
     const op_coerced = try sema.coerce(block, Type.anyerror, op, operand_src);
-    const result_ty = Type.initTag(.u16);
+    const result_ty = Type.u16;
 
     if (try sema.resolveMaybeUndefVal(block, src, op_coerced)) |val| {
         if (val.isUndef()) {
@@ -5657,32 +5649,31 @@ fn zirIntToError(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
     const inst_data = sema.code.instructions.items(.data)[inst].un_node;
     const src = inst_data.src();
     const operand_src: LazySrcLoc = .{ .node_offset_builtin_call_arg0 = inst_data.src_node };
-
-    const op = sema.resolveInst(inst_data.operand);
+    const uncasted_operand = sema.resolveInst(inst_data.operand);
+    const operand = try sema.coerce(block, Type.u16, uncasted_operand, operand_src);
     const target = sema.mod.getTarget();
 
-    if (try sema.resolveDefinedValue(block, operand_src, op)) |value| {
-        const int = value.toUnsignedInt(target);
+    if (try sema.resolveDefinedValue(block, operand_src, operand)) |value| {
+        const int = try sema.usizeCast(block, operand_src, value.toUnsignedInt(target));
         if (int > sema.mod.global_error_set.count() or int == 0)
             return sema.fail(block, operand_src, "integer value {d} represents no error", .{int});
         const payload = try sema.arena.create(Value.Payload.Error);
         payload.* = .{
             .base = .{ .tag = .@"error" },
-            .data = .{ .name = sema.mod.error_name_list.items[@intCast(usize, int)] },
+            .data = .{ .name = sema.mod.error_name_list.items[int] },
         };
         return sema.addConstant(Type.anyerror, Value.initPayload(&payload.base));
     }
     try sema.requireRuntimeBlock(block, src);
     if (block.wantSafety()) {
-        return sema.fail(block, src, "TODO: get max errors in compilation", .{});
-        // const is_gt_max = @panic("TODO get max errors in compilation");
-        // try sema.addSafetyCheck(block, is_gt_max, .invalid_error_code);
+        const is_lt_len = try block.addUnOp(.cmp_lt_errors_len, operand);
+        try sema.addSafetyCheck(block, is_lt_len, .invalid_error_code);
     }
     return block.addInst(.{
         .tag = .bitcast,
         .data = .{ .ty_op = .{
             .ty = Air.Inst.Ref.anyerror_type,
-            .operand = op,
+            .operand = operand,
         } },
     });
 }
@@ -6410,10 +6401,20 @@ fn funcCommon(
             }
         }
 
-        is_generic = is_generic or
-            try sema.typeRequiresComptime(block, ret_ty_src, bare_return_type);
+        const ret_poison = if (!is_generic) rp: {
+            if (sema.typeRequiresComptime(block, ret_ty_src, bare_return_type)) |ret_comptime| {
+                is_generic = ret_comptime;
+                break :rp bare_return_type.tag() == .generic_poison;
+            } else |err| switch (err) {
+                error.GenericPoison => {
+                    is_generic = true;
+                    break :rp true;
+                },
+                else => |e| return e,
+            }
+        } else bare_return_type.tag() == .generic_poison;
 
-        const return_type = if (!inferred_error_set or bare_return_type.tag() == .generic_poison)
+        const return_type = if (!inferred_error_set or ret_poison)
             bare_return_type
         else blk: {
             const node = try sema.gpa.create(Module.Fn.InferredErrorSetListNode);
@@ -6477,12 +6478,14 @@ fn funcCommon(
         param_name.* = try sema.gpa.dupeZ(u8, block.params.items[i].name);
     }
 
+    const hash = new_func.hash;
     const fn_payload = try sema.arena.create(Value.Payload.Function);
     new_func.* = .{
         .state = anal_state,
         .zir_body_inst = func_inst,
         .owner_decl = sema.owner_decl,
         .comptime_args = comptime_args,
+        .hash = hash,
         .lbrace_line = src_locs.lbrace_line,
         .rbrace_line = src_locs.rbrace_line,
         .lbrace_column = @truncate(u16, src_locs.columns),
@@ -10250,6 +10253,11 @@ fn zirAsm(
     const inputs_len = @truncate(u5, extended.small >> 5);
     const clobbers_len = @truncate(u5, extended.small >> 10);
     const is_volatile = @truncate(u1, extended.small >> 15) != 0;
+    const is_global_assembly = sema.func == null;
+
+    if (block.is_comptime and !is_global_assembly) {
+        try sema.requireRuntimeBlock(block, src);
+    }
 
     if (extra.data.asm_source == 0) {
         // This can move to become an AstGen error after inline assembly improvements land
@@ -10287,19 +10295,24 @@ fn zirAsm(
     };
 
     const args = try sema.arena.alloc(Air.Inst.Ref, inputs_len);
-    const inputs = try sema.arena.alloc([]const u8, inputs_len);
+    const inputs = try sema.arena.alloc(struct { c: []const u8, n: []const u8 }, inputs_len);
 
     for (args) |*arg, arg_i| {
         const input = sema.code.extraData(Zir.Inst.Asm.Input, extra_i);
         extra_i = input.end;
 
-        const name = sema.code.nullTerminatedString(input.data.name);
-        _ = name; // TODO: use the name
+        const uncasted_arg = sema.resolveInst(input.data.operand);
+        const uncasted_arg_ty = sema.typeOf(uncasted_arg);
+        switch (uncasted_arg_ty.zigTypeTag()) {
+            .ComptimeInt => arg.* = try sema.coerce(block, Type.initTag(.usize), uncasted_arg, src),
+            .ComptimeFloat => arg.* = try sema.coerce(block, Type.initTag(.f64), uncasted_arg, src),
+            else => arg.* = uncasted_arg,
+        }
 
-        arg.* = sema.resolveInst(input.data.operand);
         const constraint = sema.code.nullTerminatedString(input.data.constraint);
-        needed_capacity += constraint.len / 4 + 1;
-        inputs[arg_i] = constraint;
+        const name = sema.code.nullTerminatedString(input.data.name);
+        needed_capacity += (constraint.len + name.len + 1) / 4 + 1;
+        inputs[arg_i] = .{ .c = constraint, .n = name };
     }
 
     const clobbers = try sema.arena.alloc([]const u8, clobbers_len);
@@ -10314,7 +10327,6 @@ fn zirAsm(
     needed_capacity += (asm_source.len + 3) / 4;
 
     const gpa = sema.gpa;
-    try sema.requireRuntimeBlock(block, src);
     try sema.air_extra.ensureUnusedCapacity(gpa, needed_capacity);
     const asm_air = try block.addInst(.{
         .tag = .assembly,
@@ -10339,11 +10351,13 @@ fn zirAsm(
         buffer[o.constraint.len] = 0;
         sema.air_extra.items.len += o.constraint.len / 4 + 1;
     }
-    for (inputs) |constraint| {
+    for (inputs) |input| {
         const buffer = mem.sliceAsBytes(sema.air_extra.unusedCapacitySlice());
-        mem.copy(u8, buffer, constraint);
-        buffer[constraint.len] = 0;
-        sema.air_extra.items.len += constraint.len / 4 + 1;
+        mem.copy(u8, buffer, input.c);
+        buffer[input.c.len] = 0;
+        mem.copy(u8, buffer[input.c.len + 1 ..], input.n);
+        buffer[input.c.len + 1 + input.n.len] = 0;
+        sema.air_extra.items.len += (input.c.len + input.n.len + 1) / 4 + 1;
     }
     for (clobbers) |clobber| {
         const buffer = mem.sliceAsBytes(sema.air_extra.unusedCapacitySlice());
@@ -13570,7 +13584,7 @@ fn reifyStruct(
         .zir_index = inst,
         .layout = layout_val.toEnum(std.builtin.Type.ContainerLayout),
         .status = .have_field_types,
-        .known_non_opv = undefined,
+        .known_non_opv = false,
         .namespace = .{
             .parent = block.namespace,
             .ty = struct_ty,
@@ -18140,11 +18154,6 @@ fn coerce(
                 return sema.addConstUndef(dest_ty);
             },
             else => {
-                // undefined sets the error code also to undefined.
-                if (is_undef) {
-                    return sema.addConstUndef(dest_ty);
-                }
-
                 // T to E!T
                 return sema.wrapErrorUnionPayload(block, dest_ty, inst, inst_src);
             },
@@ -19975,18 +19984,39 @@ fn analyzeIsNonErr(
     if (ot == .ErrorSet) return Air.Inst.Ref.bool_false;
     assert(ot == .ErrorUnion);
 
+    if (Air.refToIndex(operand)) |operand_inst| {
+        const air_tags = sema.air_instructions.items(.tag);
+        if (air_tags[operand_inst] == .wrap_errunion_payload) {
+            return Air.Inst.Ref.bool_true;
+        }
+    }
+
+    const maybe_operand_val = try sema.resolveMaybeUndefVal(block, src, operand);
+
     // exception if the error union error set is known to be empty,
     // we allow the comparison but always make it comptime known.
     const set_ty = operand_ty.errorUnionSet();
     switch (set_ty.tag()) {
-        .anyerror, .error_set_inferred => {},
+        .anyerror => {},
+        .error_set_inferred => blk: {
+            // If the error set is empty, we must return a comptime true or false.
+            // However we want to avoid unnecessarily resolving an inferred error set
+            // in case it is already non-empty.
+            const ies = set_ty.castTag(.error_set_inferred).?.data;
+            if (ies.is_anyerror) break :blk;
+            if (ies.errors.count() != 0) break :blk;
+            if (maybe_operand_val == null) {
+                try sema.resolveInferredErrorSet(block, src, ies);
+                if (ies.is_anyerror) break :blk;
+                if (ies.errors.count() == 0) return Air.Inst.Ref.bool_true;
+            }
+        },
         else => if (set_ty.errorSetNames().len == 0) return Air.Inst.Ref.bool_true,
     }
 
-    const result_ty = Type.bool;
-    if (try sema.resolveMaybeUndefVal(block, src, operand)) |err_union| {
+    if (maybe_operand_val) |err_union| {
         if (err_union.isUndef()) {
-            return sema.addConstUndef(result_ty);
+            return sema.addConstUndef(Type.bool);
         }
         if (err_union.getError() == null) {
             return Air.Inst.Ref.bool_true;
@@ -20571,6 +20601,7 @@ fn wrapErrorUnionPayload(
         return sema.addConstant(dest_ty, try Value.Tag.eu_payload.create(sema.arena, val));
     }
     try sema.requireRuntimeBlock(block, inst_src);
+    try sema.queueFullTypeResolution(dest_payload_ty);
     return block.addTyOp(.wrap_errunion_payload, dest_ty, coerced);
 }
 
@@ -21360,6 +21391,9 @@ fn resolveStructFully(
         try sema.resolveTypeFully(block, src, field.ty);
     }
     struct_obj.status = .fully_resolved;
+
+    // And let's not forget comptime-only status.
+    _ = try sema.typeRequiresComptime(block, src, ty);
 }
 
 fn resolveUnionFully(
@@ -21383,6 +21417,9 @@ fn resolveUnionFully(
         try sema.resolveTypeFully(block, src, field.ty);
     }
     union_obj.status = .fully_resolved;
+
+    // And let's not forget comptime-only status.
+    _ = try sema.typeRequiresComptime(block, src, ty);
 }
 
 pub fn resolveTypeFields(sema: *Sema, block: *Block, src: LazySrcLoc, ty: Type) CompileError!Type {
@@ -21512,6 +21549,7 @@ fn resolveInferredErrorSet(
     var it = ies.inferred_error_sets.keyIterator();
     while (it.next()) |other_error_set_ptr| {
         const other_ies: *Module.Fn.InferredErrorSet = other_error_set_ptr.*;
+        if (ies == other_ies) continue;
         try sema.resolveInferredErrorSet(block, src, other_ies);
 
         for (other_ies.errors.keys()) |key| {
@@ -21670,6 +21708,10 @@ fn semaStructFields(
 
         // TODO emit compile errors for invalid field types
         // such as arrays and pointers inside packed structs.
+
+        if (field_ty.tag() == .generic_poison) {
+            return error.GenericPoison;
+        }
 
         const gop = struct_obj.fields.getOrPutAssumeCapacity(field_name);
         assert(!gop.found_existing);
@@ -21917,6 +21959,10 @@ fn semaUnionFields(mod: *Module, union_obj: *Module.Union) CompileError!void {
             // that points to this type expression rather than the union.
             // But only resolve the source location if we need to emit a compile error.
             try sema.resolveType(&block_scope, src, field_type_ref);
+
+        if (field_ty.tag() == .generic_poison) {
+            return error.GenericPoison;
+        }
 
         const gop = union_obj.fields.getOrPutAssumeCapacity(field_name);
         assert(!gop.found_existing);

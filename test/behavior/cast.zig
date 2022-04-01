@@ -360,7 +360,11 @@ test "expected [*c]const u8, found [*:0]const u8" {
 }
 
 test "explicit cast from integer to error type" {
-    if (builtin.zig_backend != .stage1) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
 
     try testCastIntToErr(error.ItBroke);
     comptime try testCastIntToErr(error.ItBroke);
@@ -1371,4 +1375,14 @@ test "cast compatible optional types" {
     var a: ?[:0]const u8 = null;
     var b: ?[]const u8 = a;
     try expect(b == null);
+}
+
+test "coerce undefined single-item pointer of array to error union of slice" {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+
+    const a = @as([*]u8, undefined)[0..0];
+    var b: error{a}![]const u8 = a;
+    const s = try b;
+    try expect(s.len == 0);
 }
