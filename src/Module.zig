@@ -42,6 +42,7 @@ root_pkg: *Package,
 /// Normally, `main_pkg` and `root_pkg` are the same. The exception is `zig test`, in which
 /// `root_pkg` is the test runner, and `main_pkg` is the user's source file which has the tests.
 main_pkg: *Package,
+sema_prog_node: std.Progress.Node = undefined,
 
 /// Used by AstGen worker to load and store ZIR cache.
 global_zir_cache: Compilation.Directory,
@@ -3517,6 +3518,10 @@ pub fn ensureDeclAnalyzed(mod: *Module, decl: *Decl) SemaError!void {
         .unreferenced => false,
     };
 
+    var decl_prog_node = mod.sema_prog_node.start(mem.sliceTo(decl.name, 0), 0);
+    decl_prog_node.activate();
+    defer decl_prog_node.end();
+
     const type_changed = mod.semaDecl(decl) catch |err| switch (err) {
         error.AnalysisFail => {
             if (decl.analysis == .in_progress) {
@@ -4849,7 +4854,12 @@ pub fn analyzeFnBody(mod: *Module, decl: *Decl, func: *Fn, arena: Allocator) Sem
         error.GenericPoison => unreachable,
         error.ComptimeReturn => unreachable,
         error.ComptimeBreak => unreachable,
-        error.AnalysisFail => {},
+        error.AnalysisFail => {
+            // In this case our function depends on a type that had a compile error.
+            // We should not try to lower this function.
+            decl.analysis = .dependency_failure;
+            return error.AnalysisFail;
+        },
         else => |e| return e,
     };
 
@@ -4862,7 +4872,12 @@ pub fn analyzeFnBody(mod: *Module, decl: *Decl, func: *Fn, arena: Allocator) Sem
             error.GenericPoison => unreachable,
             error.ComptimeReturn => unreachable,
             error.ComptimeBreak => unreachable,
-            error.AnalysisFail => {},
+            error.AnalysisFail => {
+                // In this case our function depends on a type that had a compile error.
+                // We should not try to lower this function.
+                decl.analysis = .dependency_failure;
+                return error.AnalysisFail;
+            },
             else => |e| return e,
         };
     }

@@ -1307,11 +1307,17 @@ fn genInst(self: *Self, inst: Air.Inst.Index) !WValue {
         .shl_exact => self.airBinOp(inst, .shl),
         .shr, .shr_exact => self.airBinOp(inst, .shr),
         .xor => self.airBinOp(inst, .xor),
+        .max => self.airMaxMin(inst, .max),
+        .min => self.airMaxMin(inst, .min),
+        .mul_add => self.airMulAdd(inst),
 
         .add_with_overflow => self.airBinOpOverflow(inst, .add),
         .sub_with_overflow => self.airBinOpOverflow(inst, .sub),
         .shl_with_overflow => self.airBinOpOverflow(inst, .shl),
         .mul_with_overflow => self.airBinOpOverflow(inst, .mul),
+
+        .clz => self.airClz(inst),
+        .ctz => self.airCtz(inst),
 
         .cmp_eq => self.airCmp(inst, .eq),
         .cmp_gte => self.airCmp(inst, .gte),
@@ -1431,14 +1437,10 @@ fn genInst(self: *Self, inst: Air.Inst.Index) !WValue {
         .div_floor,
         .div_exact,
         .mod,
-        .max,
-        .min,
         .assembly,
         .shl_sat,
         .ret_addr,
         .frame_addr,
-        .clz,
-        .ctz,
         .byte_swap,
         .bit_reverse,
         .is_err_ptr,
@@ -1468,7 +1470,6 @@ fn genInst(self: *Self, inst: Air.Inst.Index) !WValue {
         .atomic_store_seq_cst,
         .atomic_rmw,
         .tag_name,
-        .mul_add,
         => |tag| return self.fail("TODO: Implement wasm inst: {s}", .{@tagName(tag)}),
     };
 }
@@ -1721,8 +1722,7 @@ fn load(self: *Self, operand: WValue, ty: Type, offset: u32) InnerError!WValue {
     else
         .signed;
 
-    // TODO: Revisit below to determine if optional zero-sized pointers should still have abi-size 4.
-    const abi_size = if (ty.isPtrLikeOptional()) @as(u8, 4) else @intCast(u8, ty.abiSize(self.target));
+    const abi_size = @intCast(u8, ty.abiSize(self.target));
 
     const opcode = buildOpcode(.{
         .valtype1 = typeToValtype(ty, self.target),
@@ -3872,4 +3872,150 @@ fn airBinOpOverflow(self: *Self, inst: Air.Inst.Index, op: Op) InnerError!WValue
     try self.store(result_ptr, overflow_bit, Type.initTag(.u1), offset);
 
     return result_ptr;
+}
+
+fn airMaxMin(self: *Self, inst: Air.Inst.Index, op: enum { max, min }) InnerError!WValue {
+    if (self.liveness.isUnused(inst)) return WValue{ .none = {} };
+    const bin_op = self.air.instructions.items(.data)[inst].bin_op;
+    const ty = self.air.typeOfIndex(inst);
+    if (ty.zigTypeTag() == .Vector) {
+        return self.fail("TODO: `@maximum` and `@minimum` for vectors", .{});
+    }
+
+    if (ty.abiSize(self.target) > 8) {
+        return self.fail("TODO: `@maximum` and `@minimum` for types larger than 8 bytes", .{});
+    }
+
+    const lhs = try self.resolveInst(bin_op.lhs);
+    const rhs = try self.resolveInst(bin_op.rhs);
+
+    const result = try self.allocLocal(ty);
+
+    try self.startBlock(.block, wasm.block_empty);
+    try self.startBlock(.block, wasm.block_empty);
+
+    // check if LHS is greater/lesser than RHS
+    const cmp_result = try self.cmp(lhs, rhs, ty, if (op == .max) .gt else .lt);
+    try self.addLabel(.local_get, cmp_result.local);
+    try self.addLabel(.br_if, 0); // break to outer loop if LHS is greater/lesser than RHS
+
+    // set RHS as max/min
+    try self.emitWValue(rhs);
+    try self.addLabel(.local_set, result.local);
+    try self.addLabel(.br, 1); // break out of all blocks
+    try self.endBlock();
+
+    // set LHS as max/min
+    try self.emitWValue(lhs);
+    try self.addLabel(.local_set, result.local);
+    try self.endBlock();
+
+    return result;
+}
+
+fn airMulAdd(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
+    if (self.liveness.isUnused(inst)) return WValue{ .none = {} };
+    const pl_op = self.air.instructions.items(.data)[inst].pl_op;
+    const bin_op = self.air.extraData(Air.Bin, pl_op.payload).data;
+    const ty = self.air.typeOfIndex(inst);
+    if (ty.zigTypeTag() == .Vector) {
+        return self.fail("TODO: `@mulAdd` for vectors", .{});
+    }
+
+    if (ty.floatBits(self.target) == 16) {
+        return self.fail("TODO: `@mulAdd` for f16", .{});
+    }
+
+    const addend = try self.resolveInst(pl_op.operand);
+    const lhs = try self.resolveInst(bin_op.lhs);
+    const rhs = try self.resolveInst(bin_op.rhs);
+
+    const mul_result = try self.binOp(lhs, rhs, ty, .mul);
+    return self.binOp(mul_result, addend, ty, .add);
+}
+
+fn airClz(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
+    if (self.liveness.isUnused(inst)) return WValue{ .none = {} };
+    const ty_op = self.air.instructions.items(.data)[inst].ty_op;
+    const ty = self.air.typeOf(ty_op.operand);
+    const result_ty = self.air.typeOfIndex(inst);
+    if (ty.zigTypeTag() == .Vector) {
+        return self.fail("TODO: `@clz` for vectors", .{});
+    }
+
+    const operand = try self.resolveInst(ty_op.operand);
+    const int_info = ty.intInfo(self.target);
+    const wasm_bits = toWasmBits(int_info.bits) orelse {
+        return self.fail("TODO: `@clz` for integers with bitsize '{d}'", .{int_info.bits});
+    };
+
+    try self.emitWValue(operand);
+    switch (wasm_bits) {
+        32 => {
+            try self.addTag(.i32_clz);
+
+            if (wasm_bits != int_info.bits) {
+                const tmp = try self.allocLocal(ty);
+                try self.addLabel(.local_set, tmp.local);
+                const val: i32 = -@intCast(i32, wasm_bits - int_info.bits);
+                return self.wrapBinOp(tmp, .{ .imm32 = @bitCast(u32, val) }, ty, .add);
+            }
+        },
+        64 => {
+            try self.addTag(.i64_clz);
+
+            if (wasm_bits != int_info.bits) {
+                const tmp = try self.allocLocal(ty);
+                try self.addLabel(.local_set, tmp.local);
+                const val: i64 = -@intCast(i64, wasm_bits - int_info.bits);
+                return self.wrapBinOp(tmp, .{ .imm64 = @bitCast(u64, val) }, ty, .add);
+            }
+        },
+        else => unreachable,
+    }
+
+    const result = try self.allocLocal(result_ty);
+    try self.addLabel(.local_set, result.local);
+    return result;
+}
+
+fn airCtz(self: *Self, inst: Air.Inst.Index) InnerError!WValue {
+    if (self.liveness.isUnused(inst)) return WValue{ .none = {} };
+    const ty_op = self.air.instructions.items(.data)[inst].ty_op;
+    const ty = self.air.typeOf(ty_op.operand);
+    const result_ty = self.air.typeOfIndex(inst);
+
+    if (ty.zigTypeTag() == .Vector) {
+        return self.fail("TODO: `@ctz` for vectors", .{});
+    }
+
+    const operand = try self.resolveInst(ty_op.operand);
+    const int_info = ty.intInfo(self.target);
+    const wasm_bits = toWasmBits(int_info.bits) orelse {
+        return self.fail("TODO: `@clz` for integers with bitsize '{d}'", .{int_info.bits});
+    };
+
+    switch (wasm_bits) {
+        32 => {
+            if (wasm_bits != int_info.bits) {
+                const val: u32 = @as(u32, 1) << @intCast(u5, int_info.bits);
+                const bin_op = try self.binOp(operand, .{ .imm32 = val }, ty, .@"or");
+                try self.emitWValue(bin_op);
+            } else try self.emitWValue(operand);
+            try self.addTag(.i32_ctz);
+        },
+        64 => {
+            if (wasm_bits != int_info.bits) {
+                const val: u64 = @as(u64, 1) << @intCast(u6, int_info.bits);
+                const bin_op = try self.binOp(operand, .{ .imm64 = val }, ty, .@"or");
+                try self.emitWValue(bin_op);
+            } else try self.emitWValue(operand);
+            try self.addTag(.i64_ctz);
+        },
+        else => unreachable,
+    }
+
+    const result = try self.allocLocal(result_ty);
+    try self.addLabel(.local_set, result.local);
+    return result;
 }
